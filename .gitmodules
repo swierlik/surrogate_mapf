@@ -1,0 +1,3 @@
+[submodule "ggo_public"]
+	path = ggo_public
+	url = https://github.com/lunjohnzhang/ggo_public.git
