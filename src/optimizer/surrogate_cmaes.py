@@ -1,20 +1,23 @@
 """Surrogate-assisted CMA-ES optimizer.
 
-Extends the vanilla multi-emitter CMA-ES with an MLP surrogate that
-pre-screens candidates before expensive simulation.
+Extends the vanilla multi-emitter CMA-ES with an ensemble MLP surrogate that
+pre-screens candidates before expensive simulation using UCB acquisition.
 
 Three modes per generation:
   - Warmup  (gen < warmup_gens):       Full eval all 100, build training data
   - Control (gen % interval == 0):     Full eval all 100, full surrogate retrain
-  - Surrogate (all other gens):        Eval top screen_k only, fine-tune surrogate
+  - Surrogate (all other gens):        Eval top screen_k by UCB score, fine-tune
 
-Unevaluated candidates receive surrogate-predicted fitness when telling
-emitters, so CMA-ES always gets a complete update. Control gens correct
-for any accumulated surrogate drift.
+UCB screening: score = mean_pred + ucb_lambda * std_pred
+  High uncertainty (e.g. post-restart regions) automatically gets evaluated
+  regardless of predicted rank, correcting for surrogate blind spots.
+
+Unevaluated candidates receive surrogate mean predictions as placeholder
+fitnesses when telling emitters, so CMA-ES always gets a complete update.
 
 Usage:
-    python -m src.optimizer.surrogate_cmaes --generations 300 --output results/surrogate
-    python -m src.optimizer.surrogate_cmaes --resume results/surrogate
+    python -m src.optimizer.surrogate_cmaes --generations 300 --output results/surrogate_v3
+    python -m src.optimizer.surrogate_cmaes --resume results/surrogate_v3
 """
 
 import argparse
@@ -27,7 +30,7 @@ import numpy as np
 
 from src.optimizer.vanilla_cmaes import CMAEmitter
 from src.simulator.evaluate import evaluate_batch, get_sol_size
-from src.surrogate.mlp_model import MLPSurrogate, MLPThroughputModel
+from src.surrogate.mlp_model import EnsembleSurrogate, MLPSurrogate, MLPThroughputModel
 from src.utils.data import RunLogger, load_run_data
 from src.utils.metrics import spearman_rho
 
@@ -36,36 +39,78 @@ CHECKPOINT_FILE = "checkpoint.pkl"
 
 
 # ---------------------------------------------------------------------------
-# Surrogate serialization (without modifying mlp_model.py)
+# Surrogate serialization
 # ---------------------------------------------------------------------------
 
 def _save_surrogate_state(surrogate):
-    """Serialize MLPSurrogate to a picklable dict."""
+    """Serialize surrogate to a picklable dict. Handles both MLP and Ensemble."""
     if not surrogate.is_fitted:
         return None
-    return {
-        "state_dict": {k: v.cpu().clone() for k, v in surrogate.model.state_dict().items()},
-        "X_mean": surrogate._X_mean,
-        "X_std": surrogate._X_std,
-        "y_mean": surrogate._y_mean,
-        "y_std": surrogate._y_std,
-        "is_fitted": True,
-    }
+
+    if isinstance(surrogate, EnsembleSurrogate):
+        return {
+            "type": "ensemble",
+            "n_models": surrogate.n_models,
+            "bootstrap_frac": surrogate.bootstrap_frac,
+            "model_states": [
+                {
+                    "state_dict": {k: v.cpu().clone()
+                                   for k, v in m.model.state_dict().items()},
+                    "X_mean": m._X_mean,
+                    "X_std":  m._X_std,
+                    "y_mean": m._y_mean,
+                    "y_std":  m._y_std,
+                }
+                for m in surrogate.models
+            ],
+        }
+    else:  # MLPSurrogate (backward compat for V1/V2 checkpoints)
+        return {
+            "type": "mlp",
+            "state_dict": {k: v.cpu().clone()
+                           for k, v in surrogate.model.state_dict().items()},
+            "X_mean": surrogate._X_mean,
+            "X_std":  surrogate._X_std,
+            "y_mean": surrogate._y_mean,
+            "y_std":  surrogate._y_std,
+            "is_fitted": True,
+        }
 
 
 def _load_surrogate_state(state, input_dim=4074, **kwargs):
-    """Restore MLPSurrogate from serialized dict."""
-    s = MLPSurrogate(**kwargs)
-    s.model = MLPThroughputModel(input_dim=input_dim).to(s.device)
-    s.model.load_state_dict(state["state_dict"])
-    s.model.to(s.device)
-    s.model.eval()
-    s._X_mean = state["X_mean"]
-    s._X_std = state["X_std"]
-    s._y_mean = state["y_mean"]
-    s._y_std = state["y_std"]
-    s.is_fitted = True
-    return s
+    """Restore surrogate from serialized dict."""
+    stype = state.get("type", "mlp")
+
+    if stype == "ensemble":
+        s = EnsembleSurrogate(
+            n_models=state["n_models"],
+            bootstrap_frac=state["bootstrap_frac"],
+            **kwargs,
+        )
+        for model, ms in zip(s.models, state["model_states"]):
+            model.model = MLPThroughputModel(input_dim=input_dim).to(model.device)
+            model.model.load_state_dict(ms["state_dict"])
+            model.model.to(model.device)
+            model.model.eval()
+            model._X_mean = ms["X_mean"]
+            model._X_std  = ms["X_std"]
+            model._y_mean = ms["y_mean"]
+            model._y_std  = ms["y_std"]
+            model.is_fitted = True
+        s.is_fitted = True
+        return s
+    else:  # "mlp"
+        s = MLPSurrogate(**kwargs)
+        s.model = MLPThroughputModel(input_dim=input_dim).to(s.device)
+        s.model.load_state_dict(state["state_dict"])
+        s.model.to(s.device)
+        s.model.eval()
+        s._X_mean = state["X_mean"]
+        s._X_std  = state["X_std"]
+        s._y_mean = state["y_mean"]
+        s._y_std  = state["y_std"]
+        s.is_fitted = True
+        return s
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +160,7 @@ class SurrogateLogger:
     """Writes per-generation surrogate metadata to surrogate_log.csv."""
 
     HEADER = ["generation", "mode", "n_simulated", "surrogate_rho",
-              "train_time_s", "total_sims_saved"]
+              "mean_std", "selected_std", "train_time_s", "total_sims_saved"]
 
     def __init__(self, log_dir, resume=False):
         self.path = Path(log_dir) / "surrogate_log.csv"
@@ -128,9 +173,12 @@ class SurrogateLogger:
             self._w.writerow(self.HEADER)
 
     def log(self, generation, mode, n_simulated, surrogate_rho,
-            train_time_s, total_sims_saved):
-        rho_str = f"{surrogate_rho:.4f}" if surrogate_rho is not None else ""
+            mean_std, selected_std, train_time_s, total_sims_saved):
+        rho_str  = f"{surrogate_rho:.4f}" if surrogate_rho  is not None else ""
+        mstd_str = f"{mean_std:.4f}"      if mean_std       is not None else ""
+        sstd_str = f"{selected_std:.4f}"  if selected_std   is not None else ""
         self._w.writerow([generation, mode, n_simulated, rho_str,
+                          mstd_str, sstd_str,
                           f"{train_time_s:.2f}", total_sims_saved])
         self._f.flush()
 
@@ -152,20 +200,27 @@ def run_surrogate_cmaes(
     sigma0=5.0,
     initial_mean=5.0,
     seed=42,
-    output_dir="results/surrogate",
+    output_dir="results/surrogate_v3",
     resume=False,
     n_workers=8,
     warmup_gens=20,
     screen_k=20,
     evolution_control_interval=10,
+    n_ensemble=5,
+    bootstrap_frac=0.8,
+    ucb_lambda=1.0,
 ):
-    """Run surrogate-assisted multi-emitter CMA-ES.
+    """Run surrogate-assisted multi-emitter CMA-ES with ensemble UCB screening.
 
     Args:
         warmup_gens: Generations of full evaluation before activating surrogate.
         screen_k: Candidates to simulate per generation (after warmup).
         evolution_control_interval: Every N gens after warmup, do a full eval
             and retrain the surrogate from scratch to correct drift.
+        n_ensemble: Number of MLP models in the ensemble.
+        bootstrap_frac: Fraction of data each ensemble model trains on.
+        ucb_lambda: Exploration weight in UCB = mean + ucb_lambda * std.
+            Higher values favour uncertain (unexplored) candidates.
 
     Returns:
         best_solution, best_throughput
@@ -181,11 +236,15 @@ def run_surrogate_cmaes(
     checkpoint_path = output_dir / CHECKPOINT_FILE
     total_pop = n_emitters * popsize_per_emitter
 
-    surrogate = MLPSurrogate(max_epochs=100, patience=10)
+    surrogate = EnsembleSurrogate(
+        n_models=n_ensemble,
+        bootstrap_frac=bootstrap_frac,
+        max_epochs=100,
+        patience=10,
+    )
     surrogate_ready = False
-    sims_saved = 0  # cumulative simulations avoided by surrogate
+    sims_saved = 0
 
-    # In-memory accumulator for surrogate training data (avoids disk-flush dependency)
     acc_X_list = []
     acc_y_list = []
 
@@ -202,7 +261,6 @@ def run_surrogate_cmaes(
             surrogate = _load_surrogate_state(surrogate_state, input_dim=sol_size)
             surrogate_ready = True
 
-        # Rebuild accumulator from disk on resume
         try:
             acc_sols, acc_tp, _ = load_run_data(output_dir)
             acc_X_list = [acc_sols]
@@ -234,7 +292,8 @@ def run_surrogate_cmaes(
 
     print(f"Solution dimensionality: {sol_size}")
     print(f"Config: {generations} gens | warmup={warmup_gens} | "
-          f"screen_k={screen_k}/{total_pop} | control_every={evolution_control_interval}")
+          f"screen_k={screen_k}/{total_pop} | control_every={evolution_control_interval} | "
+          f"ensemble={n_ensemble} | ucb_lambda={ucb_lambda}")
     print(f"Vanilla budget: {generations * total_pop * n_evals} sims | "
           f"Expected surrogate budget: ~{_estimate_sims(generations, warmup_gens, total_pop, n_evals, screen_k, evolution_control_interval)} sims")
 
@@ -251,23 +310,26 @@ def run_surrogate_cmaes(
                 all_solutions.append(sols)
                 emitter_ids.extend([emitter.emitter_id] * len(sols))
 
-            all_solutions = np.concatenate(all_solutions, axis=0)  # (total_pop, sol_size)
+            all_solutions = np.concatenate(all_solutions, axis=0)
             emitter_ids = np.array(emitter_ids, dtype=int)
 
             # 2. Decide mode
             is_warmup = gen < warmup_gens
-            is_control = (not is_warmup) and (
-                gen % evolution_control_interval == 0
-            )
+            is_control = (not is_warmup) and (gen % evolution_control_interval == 0)
             use_surrogate = surrogate_ready and not is_warmup and not is_control
 
-            # 3. Get surrogate predictions (used in all non-warmup modes)
-            surrogate_preds = None
+            # 3. Get ensemble predictions (mean + uncertainty) for all candidates
+            surr_mean = None
+            surr_std  = None
+            mean_std_val = None
+
             if surrogate_ready:
-                surrogate_preds = surrogate.predict(all_solutions)  # (total_pop,)
+                surr_mean, surr_std = surrogate.predict_with_uncertainty(all_solutions)
+                mean_std_val = float(surr_std.mean())
 
             eval_seed = seed + gen * n_evals
             train_time = 0.0
+            selected_std_val = None
 
             if is_warmup or is_control:
                 # --- Full evaluation ---
@@ -285,12 +347,12 @@ def run_surrogate_cmaes(
                 n_simulated = total_pop
                 full_mean_tp = mean_tp
 
-                # Compute surrogate rho BEFORE retraining (honest accuracy estimate)
+                # Rho BEFORE retraining = honest accuracy estimate
                 rho = None
-                if surrogate_preds is not None:
-                    rho = spearman_rho(mean_tp, surrogate_preds)
+                if surr_mean is not None:
+                    rho = spearman_rho(mean_tp, surr_mean)
 
-                # Accumulate and retrain surrogate on ALL real data seen so far
+                # Accumulate and retrain ensemble on all real data
                 acc_X_list.append(all_solutions)
                 acc_y_list.append(mean_tp)
                 t_train = time.time()
@@ -300,14 +362,16 @@ def run_surrogate_cmaes(
                 train_time = time.time() - t_train
                 surrogate_ready = True
 
-                # Log real evaluations
                 logger.log_generation(gen, all_solutions, mean_tp, all_tp, emitter_ids)
 
             else:
-                # --- Surrogate-assisted ---
+                # --- Surrogate-assisted with UCB screening ---
                 mode = "surrogate"
-                top_idx = np.argsort(-surrogate_preds)[:screen_k]
-                eval_solutions = all_solutions[top_idx]
+                ucb_scores = surr_mean + ucb_lambda * surr_std
+                top_idx = np.argsort(-ucb_scores)[:screen_k]
+                selected_std_val = float(surr_std[top_idx].mean())
+
+                eval_solutions   = all_solutions[top_idx]
                 eval_emitter_ids = emitter_ids[top_idx]
 
                 mean_tp, all_tp = evaluate_batch(
@@ -323,56 +387,55 @@ def run_surrogate_cmaes(
                 sims_saved += (total_pop - screen_k) * n_evals
                 n_simulated = screen_k
 
-                # Build full fitness array: real for top-k, surrogate for rest
-                full_mean_tp = surrogate_preds.copy()
+                # Placeholder fitnesses: real for top-k, surrogate mean for rest
+                full_mean_tp = surr_mean.copy()
                 full_mean_tp[top_idx] = mean_tp
 
-                # Accumulate real data and fine-tune surrogate
                 acc_X_list.append(eval_solutions)
                 acc_y_list.append(mean_tp)
                 t_train = time.time()
                 surrogate.fine_tune(eval_solutions, mean_tp, epochs=10)
                 train_time = time.time() - t_train
 
-                # Log only real evaluations (keeps training data clean)
                 logger.log_generation(gen, eval_solutions, mean_tp, all_tp, eval_emitter_ids)
 
-                rho = None  # no honest rho available this gen (can't compare to ground truth)
+                rho = None
 
-            # 4. Tell each emitter (always full batch with full_mean_tp)
+            # 4. Tell each emitter (always full batch)
             pos = 0
             for emitter in emitters:
                 end = pos + emitter.popsize
                 emitter.tell(
                     all_solutions[pos:end],
-                    -full_mean_tp[pos:end],  # negate: CMA-ES minimizes
+                    -full_mean_tp[pos:end],
                 )
                 pos = end
 
             # 5. Track best (only from real evaluations)
             if use_surrogate:
-                real_mean_tp = mean_tp  # only top-k
+                real_mean_tp  = mean_tp
                 real_solutions = eval_solutions
             else:
-                real_mean_tp = full_mean_tp
+                real_mean_tp  = full_mean_tp
                 real_solutions = all_solutions
 
             gen_best_idx = np.argmax(real_mean_tp)
-            gen_best_tp = real_mean_tp[gen_best_idx]
+            gen_best_tp  = real_mean_tp[gen_best_idx]
             if gen_best_tp > best_throughput:
                 best_throughput = gen_best_tp
-                best_solution = real_solutions[gen_best_idx].copy()
+                best_solution   = real_solutions[gen_best_idx].copy()
 
             elapsed = time.time() - t0
             cumulative_wallclock += elapsed
 
-            # 6. Log best and surrogate metadata
+            # 6. Log
             logger.log_best(gen, best_throughput, gen_best_tp,
                             gen_wallclock_s=elapsed,
                             cumulative_wallclock_s=cumulative_wallclock)
-            surr_logger.log(gen, mode, n_simulated, rho, train_time, sims_saved)
+            surr_logger.log(gen, mode, n_simulated, rho,
+                            mean_std_val, selected_std_val,
+                            train_time, sims_saved)
 
-            # Flush solutions every 5 gens
             if (gen + 1) % 5 == 0:
                 logger.flush_solutions()
 
@@ -397,7 +460,8 @@ def run_surrogate_cmaes(
             cum_h, cum_m = divmod(int(cumulative_wallclock), 3600)
             cum_m = cum_m // 60
             restart_str = f" | restarts={restart_info}" if restart_info else ""
-            rho_str = f" | rho={rho:.3f}" if rho is not None else ""
+            rho_str  = f" | rho={rho:.3f}"               if rho          is not None else ""
+            std_str  = f" | std={mean_std_val:.3f}"       if mean_std_val is not None else ""
             print(
                 f"Gen {gen+1:3d}/{generations} [{mode:9s}] | "
                 f"best={best_throughput:.4f} | "
@@ -405,7 +469,7 @@ def run_surrogate_cmaes(
                 f"sims={total_sims} (saved={sims_saved}) | "
                 f"time={elapsed:.1f}s | "
                 f"total={cum_h}h{cum_m:02d}m"
-                f"{rho_str}{restart_str}"
+                f"{rho_str}{std_str}{restart_str}"
             )
 
     finally:
@@ -426,7 +490,6 @@ def run_surrogate_cmaes(
 
 
 def _estimate_sims(generations, warmup_gens, total_pop, n_evals, screen_k, ctrl_interval):
-    """Rough estimate of total simulations."""
     warmup = warmup_gens * total_pop * n_evals
     remaining = generations - warmup_gens
     control_gens = remaining // ctrl_interval
@@ -440,22 +503,25 @@ def _estimate_sims(generations, warmup_gens, total_pop, n_evals, screen_k, ctrl_
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Surrogate-assisted CMA-ES (multi-emitter + MLP pre-screening)")
-    parser.add_argument("--generations", type=int, default=300)
-    parser.add_argument("--n-emitters", type=int, default=5)
-    parser.add_argument("--popsize", type=int, default=20)
-    parser.add_argument("--n-evals", type=int, default=5)
-    parser.add_argument("--num-agents", type=int, default=400)
-    parser.add_argument("--simulation-steps", type=int, default=1000)
-    parser.add_argument("--sigma0", type=float, default=5.0)
-    parser.add_argument("--initial-mean", type=float, default=5.0)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default="results/surrogate")
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--n-workers", type=int, default=8)
-    parser.add_argument("--warmup-gens", type=int, default=20)
-    parser.add_argument("--screen-k", type=int, default=20)
-    parser.add_argument("--evolution-control-interval", type=int, default=10)
+        description="Surrogate-assisted CMA-ES (ensemble MLP + UCB screening)")
+    parser.add_argument("--generations",                type=int,   default=300)
+    parser.add_argument("--n-emitters",                 type=int,   default=5)
+    parser.add_argument("--popsize",                    type=int,   default=20)
+    parser.add_argument("--n-evals",                    type=int,   default=5)
+    parser.add_argument("--num-agents",                 type=int,   default=400)
+    parser.add_argument("--simulation-steps",           type=int,   default=1000)
+    parser.add_argument("--sigma0",                     type=float, default=5.0)
+    parser.add_argument("--initial-mean",               type=float, default=5.0)
+    parser.add_argument("--seed",                       type=int,   default=42)
+    parser.add_argument("--output",                     type=str,   default="results/surrogate_v3")
+    parser.add_argument("--resume",                     action="store_true")
+    parser.add_argument("--n-workers",                  type=int,   default=8)
+    parser.add_argument("--warmup-gens",                type=int,   default=20)
+    parser.add_argument("--screen-k",                   type=int,   default=20)
+    parser.add_argument("--evolution-control-interval", type=int,   default=10)
+    parser.add_argument("--n-ensemble",                 type=int,   default=5)
+    parser.add_argument("--bootstrap-frac",             type=float, default=0.8)
+    parser.add_argument("--ucb-lambda",                 type=float, default=1.0)
     args = parser.parse_args()
 
     run_surrogate_cmaes(
@@ -474,6 +540,9 @@ def main():
         warmup_gens=args.warmup_gens,
         screen_k=args.screen_k,
         evolution_control_interval=args.evolution_control_interval,
+        n_ensemble=args.n_ensemble,
+        bootstrap_frac=args.bootstrap_frac,
+        ucb_lambda=args.ucb_lambda,
     )
 
 

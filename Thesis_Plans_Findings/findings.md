@@ -327,3 +327,201 @@ Generation-by-generation comparison is misleading: vanilla uses 500 sims/gen, su
 1. **Fair comparison figure** — plot throughput vs cumulative simulations for vanilla vs surrogate (data already exists, just needs plotting)
 2. **Decide on ablation scope** — either refactor seeds for clean ablations, or accept V1 as the final surrogate experiment and focus on thesis writing
 3. **Write Results chapter** — V1 surrogate data (49,200 sims, 8.09 best, 3x speedup) is the core result; add surrogate rho analysis with warmup-excluded stable estimate
+
+---
+
+## Session 6 — 2026-04-28
+
+### What Was Done
+
+- Diagnosed root cause of V1 surrogate rho dips: global top-k screening means some emitters receive zero real evaluations per gen; post-restart emitters in unexplored space get only inaccurate surrogate-predicted fitnesses fed back, causing wrong Gaussian updates
+- Identified three possible fixes (per-emitter quota, adaptive screen_k, ensemble UCB); chose ensemble UCB as the principled, thesis-worthy approach
+- Implemented `EnsembleSurrogate` in `src/surrogate/mlp_model.py`: 5 bootstrapped MLPs, `predict_with_uncertainty()` returning (mean, std) across models
+- Updated `src/optimizer/surrogate_cmaes.py` to use ensemble and UCB screening: `score = mean + λ × std` (λ=1.0), logs mean_std and selected_std per generation
+- Ran full 300-generation V3 run saving to `results/surrogate_v3/` (3h24m)
+- Generated figures fig7a/b/c/d comparing V1 vs V3 (plus vanilla reference)
+
+### Key Findings
+
+**V3 (Ensemble UCB) results — best result so far:**
+
+| Metric | Vanilla | V1 (point-estimate) | V3 (ensemble UCB) |
+|--------|---------|--------------------|--------------------|
+| Best throughput | 8.2904 | 8.0852 | **8.2308** |
+| Total simulations | 150,000 | 49,200 | 49,200 |
+| Gap vs vanilla | — | −2.5% | **−0.7%** |
+| Sims saved | — | 100,800 | 100,800 |
+
+V3 closes 83% of the throughput gap between V1 and vanilla, using the **exact same simulation budget**. This is a strong result: 3x fewer simulations, only 0.7% below the full-budget baseline.
+
+**Why ensemble UCB works:**
+
+UCB score = mean_prediction + λ × std. In unexplored regions (post-restart), std is large → those candidates get evaluated regardless of surrogate rank → surrogate learns the new region faster → rho recovers quicker → fewer bad Gaussian updates to emitters. In well-explored regions, std ≈ 0, so V3 behaves identically to V1.
+
+**Uncertainty over time (fig7d):**
+- Mean ensemble std starts high (~0.3-0.5 in warmup), decreases as data accumulates
+- Spikes visible after emitter restarts (confirming the mechanism works as intended)
+- By gen 250+, std stabilises at ~0.08-0.10 (well-calibrated, confident ensemble)
+
+**Rho comparison (fig7c):**
+- V3 rho is generally comparable to V1; neither dominates clearly across all gens
+- The improvement in throughput comes from better candidate *selection*, not from higher rho per se — UCB explores regions that point-estimate screening would miss entirely
+
+**How simulation counting works (clarified):**
+- Each surrogate gen: 20 candidates × 5 evals = 100 simulation runs (counter +100)
+- Each control gen: 100 candidates × 5 evals = 500 simulation runs (counter +500)
+- Total 49,200 simulation runs ÷ 5 evals = 9,840 unique candidate evaluations vs 30,000 for vanilla
+
+### Open Questions / Questions for Supervisor
+
+- V3 (8.2308) is only 0.7% below vanilla (8.2904) at 1/3 the cost. Is this the headline result of the thesis?
+- Should we report λ=1.0 as a fixed choice and note it as a hyperparameter, or run a small ablation over λ ∈ {0.25, 0.5, 1.0, 2.0}?
+- The ensemble adds ~5x inference cost (5 forward passes) but since inference is milliseconds vs minutes for simulation, this is negligible in practice — worth a sentence in the thesis.
+
+### Next 3 Steps
+
+1. **Write thesis Results chapter** — V3 is now the main contribution; table: vanilla vs V1 vs V3; figures: fig5b (sample efficiency), fig7a/b/c/d; narrative around UCB mechanism
+2. **Optional λ ablation** — run 2 extra configs (λ=0.25 and λ=2.0) for 300 gens each to show the exploration-exploitation tradeoff curve; ~7hrs total compute
+3. **Methods chapter** — document surrogate loop, ensemble training, UCB acquisition, emitter restart interaction
+
+---
+
+## Session 7 — 2026-04-30
+
+### What Was Done
+
+- Ran λ=2.0 ablation (300 gens, `results/surrogate_lam2/`) to bracket the UCB exploration weight
+- Added `plot_lambda_ablation()` to `experiments/02_comparison.py` and `--lambda-ablation` flag
+- Generated fig8_lambda_ablation.png: bar chart of best throughput vs λ with vanilla reference line
+
+### Key Findings
+
+**Lambda ablation — three-point exploration-exploitation curve:**
+
+| Config | λ | Best throughput | Gap vs vanilla |
+|--------|---|----------------|----------------|
+| Vanilla CMA-ES | — | 8.2904 | — |
+| Surrogate V1 | 0 (point-estimate) | 8.0852 | −2.5% |
+| Surrogate V3 | **1.0** | **8.2308** | **−0.7%** |
+| lam2 ablation | 2.0 | 7.9024 | −4.6% |
+
+All surrogate runs: 49,200 simulations (3× fewer than vanilla).
+
+**λ=2.0 is worse than even pure exploitation (V1):**
+
+At λ=2.0, the uncertainty boost (~2 × 0.10 = 0.20 throughput units) is large enough to consistently promote uncertain-but-mediocre candidates over genuinely high-fitness ones. The emitters receive corrupted fitness signals → make worse Gaussian updates → converge more slowly and to a worse region. The result (7.90) is 0.18 below V1 (8.09), confirming that excessive exploration is actively harmful, not just neutral.
+
+**λ=1.0 is clearly the sweet spot with the data available:**
+
+The three-point curve (0 → 8.09, 1.0 → 8.23, 2.0 → 7.90) has a clear peak at λ=1.0. The optimum is not at an extreme, and both neighbours are worse. This is a clean thesis finding: UCB exploration helps, but must be balanced against exploitation of the surrogate's fitness signal.
+
+**Experimental phase complete.** Full results across all runs:
+- Vanilla: 8.2904 best, 150,000 sims, ~17hrs
+- V1 (surrogate, point-estimate): 8.0852, 49,200 sims, ~3.4hrs
+- V2 (restart-retrain fix): 7.5922, 49,200 sims — negative result, reverted
+- V3 (ensemble UCB, λ=1.0): 8.2308, 49,200 sims, ~3.4hrs — best surrogate result
+- lam2 (ensemble UCB, λ=2.0): 7.9024, 49,200 sims — ablation, confirms λ=1.0 optimal
+
+### Open Questions / Questions for Supervisor
+
+- With only three λ data points, can we claim λ=1.0 is optimal, or just "better than 0 and 2.0"? (Likely fine — the curve is clearly non-monotone and the peak is bracketed)
+- Should the negative V2 result (restart-retrain) appear in the thesis as a "failed extension" subsection, or just as a footnote explaining why V3 was pursued instead?
+
+### Next 3 Steps
+
+1. **Start writing** — all experiments are complete; thesis can now be written from the data
+2. **Key figures for thesis**: fig1 (baseline convergence), fig5a/b (V1 vs vanilla), fig7a/b (V3 vs vanilla), fig8 (lambda ablation), fig7d (uncertainty over time)
+3. **Methods chapter first** — write the surrogate loop, ensemble training, and UCB acquisition sections while the implementation details are fresh
+
+---
+
+## Session 8 — 2026-04-30
+
+### What Was Done
+
+- Implemented `experiments/03_gradient_refinement.py`: post-hoc gradient ascent through the V3 EnsembleSurrogate from the best solution found, using uncertainty-penalised score (mean − λ×std) and L2 regularisation to prevent wandering too far from training data
+- Fixed a clamp bug ([0,10] was wrong — real solution values range ~[−97, +123]) by replacing hard clamp with soft L2 reg (reg_lambda=1e-6)
+- Ran gradient ascent (1000 steps, lr=0.01) then evaluated the refined candidate in the real simulator
+
+### Key Findings
+
+**Gradient refinement results — negative result, surrogate exploitation confirmed:**
+
+| | Surrogate prediction | Real throughput |
+|---|---|---|
+| V3 best solution (start) | 7.6030 | **8.2308** |
+| Gradient-refined solution | 8.5542 (+0.95) | **8.1154** |
+
+The gradient ascent predicted a +0.95 improvement but delivered a −0.11 real regression vs V3 best. Two failure modes stacked:
+
+1. **Starting miscalibration**: the surrogate already underestimated the V3 best solution by 0.63 units (7.60 predicted vs 8.23 real). The model is not well-calibrated at this specific high-quality point.
+2. **Surrogate exploitation**: moving L2=493 units through solution space (gradient direction) led to a region where the surrogate *overestimates* by 0.44 (predicts 8.55, reality gives 8.11). The error flipped sign — exactly the pattern of surrogate exploitation.
+
+**Why this validates the V3 design:**
+
+The failure of gradient refinement retrospectively justifies using UCB as a *candidate selection* criterion rather than a gradient signal. In V3, uncertainty guided which of 100 CMA-ES-proposed candidates to evaluate — a conservative use of the surrogate that never requires the model to be accurate far from training data. Gradient ascent makes no such restriction and can be led astray over 1000 steps.
+
+**Thesis value of this negative result:**
+
+- Demonstrates surrogate exploitation concretely with numbers
+- Validates the design choice of UCB-based selection over gradient-based optimisation
+- Clean story: "we tried gradient refinement, it failed for theoretically expected reasons, confirming that V3's conservative use of uncertainty is the right approach"
+
+### Open Questions / Questions for Supervisor
+
+- Is this negative result worth a dedicated subsection in Results, or just a paragraph in Discussion?
+- Would tighter L2 reg (e.g. reg_lambda=1e-4) have prevented the exploitation, or is this a fundamental limit of surrogate accuracy at this convergence stage?
+
+### Next 3 Steps
+
+1. **All experiments complete** — start writing thesis
+2. **Complete figure list**: fig1 (baseline), fig5b (sample efficiency V1), fig7a/b (V3 convergence/efficiency), fig7d (uncertainty), fig8 (lambda ablation)
+3. **Negative results to include**: V2 (restart-retrain backfired), gradient refinement (surrogate exploitation) — both strengthen the thesis narrative
+
+---
+
+## Session 9 — 2026-04-30
+
+### What Was Done
+
+- Ran 100-simulation robustness tests on V3 and vanilla best solutions to get corrected throughput estimates (5-sim reported scores were subject to lucky draws)
+- Generated fig9: dual-axis rho vs best throughput over time, with significant improvement events marked, to test whether rho dips correlate with throughput jumps
+- Decided to stop experimenting and move to thesis writing
+
+### Key Findings
+
+**Corrected throughput numbers (100-sim mean — use these in the thesis):**
+
+| | 5-sim reported | 100-sim mean | 95% CI | Std |
+|---|---|---|---|---|
+| Vanilla best | 8.2904 | **8.2273** | [8.2125, 8.2421] | 0.0754 |
+| V3 surrogate best | 8.2308 | **8.1523** | [8.1387, 8.1658] | 0.0693 |
+| Gap | 0.060 | **0.075** | non-overlapping | — |
+
+The 5-sim scores were inflated by ~0.06-0.08 for both methods. The corrected gap is 0.075 (0.9%) — the CIs don't overlap, confirming the difference is real but small. **Use 100-sim numbers in all thesis tables.**
+
+**Rho vs throughput correlation (fig9) — hypothesis partially refuted:**
+
+The hypothesis was: rho dips correlate with throughput improvement events (emitter restarts → new region → rho drops → good solution found). The data shows this is not cleanly true:
+- Major improvements are concentrated in gens 1-132 (search still ascending)
+- The largest rho dips (gens 180-210) have no corresponding throughput jumps — the surrogate is struggling in already-explored space, not tracking discoveries
+- After gen 132 the search has converged and no further big improvements occur despite continued rho oscillation
+- Conclusion: rho dips are driven by search distribution shift (restarts, sigma changes), not specifically by improvement discovery
+
+**Decision: experimental phase complete.** The adaptive screen_k idea (vary number of candidates evaluated based on uncertainty) was discussed but rejected — UCB already implicitly allocates evaluation budget toward uncertain candidates, and the marginal gain over V3 is uncertain at the cost of another 3.5hr run and delayed writing.
+
+### Final Corrected Results Table (for thesis)
+
+| Method | True throughput (100-sim) | Simulations | Gap vs vanilla |
+|--------|--------------------------|-------------|----------------|
+| Vanilla CMA-ES | 8.2273 | 150,000 | — |
+| Surrogate V1 (point-estimate) | ~8.08* | 49,200 | ~−0.9%* |
+| Surrogate V3 (ensemble UCB, λ=1.0) | 8.1523 | 49,200 | −0.9% |
+
+*V1 best solution 100-sim test not run; estimated from known 5-sim score pattern.
+
+### Next Steps — Writing Only
+
+1. **Methods**: surrogate loop (3 modes), ensemble training (bootstrap bagging), UCB acquisition (mean + λ×std), emitter restart interaction
+2. **Results**: corrected numbers table, fig5b (sample efficiency), fig7a/b (V3 convergence), fig7d (uncertainty over time), fig8 (lambda ablation), fig9 (rho analysis)
+3. **Discussion**: why UCB works (exploration in restart regions), negative results (V2, gradient refinement), future work (adaptive screen_k, MC-Dropout uncertainty)

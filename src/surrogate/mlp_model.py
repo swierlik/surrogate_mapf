@@ -184,3 +184,48 @@ class MLPSurrogate:
     @property
     def name(self):
         return "MLP"
+
+
+class EnsembleSurrogate:
+    """Ensemble of MLPs for uncertainty-aware surrogate screening.
+
+    Each model trains on a bootstrap sample so they disagree most in regions
+    with sparse training data (e.g. immediately after an emitter restart).
+    Uncertainty = std across model predictions, used in UCB screening.
+    """
+
+    def __init__(self, n_models=5, bootstrap_frac=0.8, **mlp_kwargs):
+        self.n_models = n_models
+        self.bootstrap_frac = bootstrap_frac
+        self.models = [MLPSurrogate(**mlp_kwargs) for _ in range(n_models)]
+        self.is_fitted = False
+
+    def _bootstrap_idx(self, n):
+        k = max(int(n * self.bootstrap_frac), 1)
+        return np.random.choice(n, size=k, replace=True)
+
+    def fit(self, X, y):
+        n = len(X)
+        for model in self.models:
+            idx = self._bootstrap_idx(n)
+            model.fit(X[idx], y[idx])
+        self.is_fitted = True
+
+    def fine_tune(self, X_new, y_new, epochs=10):
+        n = len(X_new)
+        for model in self.models:
+            idx = self._bootstrap_idx(n)
+            model.fine_tune(X_new[idx], y_new[idx], epochs=epochs)
+
+    def predict(self, X):
+        preds = np.stack([m.predict(X) for m in self.models], axis=0)
+        return preds.mean(axis=0)
+
+    def predict_with_uncertainty(self, X):
+        """Returns (mean, std) across ensemble — std is the uncertainty estimate."""
+        preds = np.stack([m.predict(X) for m in self.models], axis=0)
+        return preds.mean(axis=0), preds.std(axis=0)
+
+    @property
+    def name(self):
+        return "EnsembleMLP"
