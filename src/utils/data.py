@@ -38,7 +38,7 @@ class RunLogger:
         eval_headers = [f"eval_{i}" for i in range(n_evals)]
         csv_header = ["generation", "sol_idx", "emitter_id", "mean_throughput"] + eval_headers
         best_header = ["generation", "best_throughput", "best_mean_throughput",
-                       "gen_wallclock_s", "cumulative_wallclock_s"]
+                       "gen_wallclock_s", "cumulative_wallclock_s", "restarted_emitters"]
 
         if resume and self._csv_path.exists():
             # Append mode: don't overwrite existing data
@@ -84,10 +84,12 @@ class RunLogger:
         self._csv_file.flush()
 
     def log_best(self, generation, best_throughput, best_mean_throughput=None,
-                 gen_wallclock_s=0.0, cumulative_wallclock_s=0.0):
+                 gen_wallclock_s=0.0, cumulative_wallclock_s=0.0,
+                 restarted_emitters=None):
         """Append best throughput and timing for this generation."""
         if best_mean_throughput is None:
             best_mean_throughput = best_throughput
+        restart_str = ";".join(str(e) for e in restarted_emitters) if restarted_emitters else ""
         with open(self._best_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 generation,
@@ -95,6 +97,7 @@ class RunLogger:
                 f"{best_mean_throughput:.6f}",
                 f"{gen_wallclock_s:.2f}",
                 f"{cumulative_wallclock_s:.2f}",
+                restart_str,
             ])
 
     def flush_solutions(self):

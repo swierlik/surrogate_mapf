@@ -1,226 +1,74 @@
-"""Surrogate-assisted CMA-ES optimizer.
+"""Surrogate-assisted CMA-ES for online GGO (CNN policy optimization).
 
-Extends the vanilla multi-emitter CMA-ES with an ensemble MLP surrogate that
-pre-screens candidates before expensive simulation using UCB acquisition.
+Identical logic to surrogate_cmaes.py, adapted for the online GGO evaluator:
+    - sol_size = 4271  (CNN policy params)
+    - sigma0 = 0.1, initial_mean = 0.0
+    - n_evals = 2  (online simulation is slower)
+    - Uses evaluate_online_batch instead of evaluate_batch (no normalize flag)
+    - chunk_size controls Docker batch memory
 
-Three modes per generation:
-  - Warmup  (gen < warmup_gens):       Full eval all 100, build training data
-  - Control (gen % interval == 0):     Full eval all 100, full surrogate retrain
-  - Surrogate (all other gens):        Eval top screen_k by UCB score, fine-tune
-
-UCB screening: score = mean_pred + ucb_lambda * std_pred
-  High uncertainty (e.g. post-restart regions) automatically gets evaluated
-  regardless of predicted rank, correcting for surrogate blind spots.
-
-Unevaluated candidates receive surrogate mean predictions as placeholder
-fitnesses when telling emitters, so CMA-ES always gets a complete update.
+Imports all infrastructure (emitters, surrogate, logging) from the offline modules.
 
 Usage:
-    python -m src.optimizer.surrogate_cmaes --generations 300 --output results/surrogate_v3
-    python -m src.optimizer.surrogate_cmaes --resume results/surrogate_v3
+    python -m src.optimizer.surrogate_cmaes_online --generations 100 --output results/online_surrogate
+    python -m src.optimizer.surrogate_cmaes_online --resume results/online_surrogate
 """
 
 import argparse
-import csv
-import pickle
+import gc
 import time
 from pathlib import Path
 
 import numpy as np
 
 from src.optimizer.vanilla_cmaes import CMAEmitter
-from src.simulator.evaluate import evaluate_batch, get_sol_size
-from src.surrogate.mlp_model import EnsembleSurrogate, MLPSurrogate, MLPThroughputModel
+from src.optimizer.surrogate_cmaes import (
+    CHECKPOINT_FILE,
+    SurrogateLogger,
+    _save_surrogate_state,
+    _load_surrogate_state,
+    save_checkpoint,
+    load_checkpoint,
+    _estimate_sims,
+)
+from src.simulator.evaluate_online import evaluate_online_batch, get_n_params
+from src.surrogate.mlp_model import EnsembleSurrogate
 from src.utils.data import RunLogger, load_run_data
 from src.utils.metrics import spearman_rho
 
 
-CHECKPOINT_FILE = "checkpoint.pkl"
-
-
-# ---------------------------------------------------------------------------
-# Surrogate serialization
-# ---------------------------------------------------------------------------
-
-def _save_surrogate_state(surrogate):
-    """Serialize surrogate to a picklable dict. Handles both MLP and Ensemble."""
-    if not surrogate.is_fitted:
-        return None
-
-    if isinstance(surrogate, EnsembleSurrogate):
-        return {
-            "type": "ensemble",
-            "n_models": surrogate.n_models,
-            "bootstrap_frac": surrogate.bootstrap_frac,
-            "model_states": [
-                {
-                    "state_dict": {k: v.cpu().clone()
-                                   for k, v in m.model.state_dict().items()},
-                    "X_mean": m._X_mean,
-                    "X_std":  m._X_std,
-                    "y_mean": m._y_mean,
-                    "y_std":  m._y_std,
-                }
-                for m in surrogate.models
-            ],
-        }
-    else:  # MLPSurrogate (backward compat for V1/V2 checkpoints)
-        return {
-            "type": "mlp",
-            "state_dict": {k: v.cpu().clone()
-                           for k, v in surrogate.model.state_dict().items()},
-            "X_mean": surrogate._X_mean,
-            "X_std":  surrogate._X_std,
-            "y_mean": surrogate._y_mean,
-            "y_std":  surrogate._y_std,
-            "is_fitted": True,
-        }
-
-
-def _load_surrogate_state(state, input_dim=4074, **kwargs):
-    """Restore surrogate from serialized dict."""
-    stype = state.get("type", "mlp")
-
-    if stype == "ensemble":
-        s = EnsembleSurrogate(
-            n_models=state["n_models"],
-            bootstrap_frac=state["bootstrap_frac"],
-            **kwargs,
-        )
-        for model, ms in zip(s.models, state["model_states"]):
-            model.model = MLPThroughputModel(input_dim=input_dim).to(model.device)
-            model.model.load_state_dict(ms["state_dict"])
-            model.model.to(model.device)
-            model.model.eval()
-            model._X_mean = ms["X_mean"]
-            model._X_std  = ms["X_std"]
-            model._y_mean = ms["y_mean"]
-            model._y_std  = ms["y_std"]
-            model.is_fitted = True
-        s.is_fitted = True
-        return s
-    else:  # "mlp"
-        s = MLPSurrogate(**kwargs)
-        s.model = MLPThroughputModel(input_dim=input_dim).to(s.device)
-        s.model.load_state_dict(state["state_dict"])
-        s.model.to(s.device)
-        s.model.eval()
-        s._X_mean = state["X_mean"]
-        s._X_std  = state["X_std"]
-        s._y_mean = state["y_mean"]
-        s._y_std  = state["y_std"]
-        s.is_fitted = True
-        return s
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint
-# ---------------------------------------------------------------------------
-
-def save_checkpoint(path, generation, emitters, best_solution, best_throughput,
-                    rng_state, total_sims, cumulative_wallclock_s, surrogate):
-    state = {
-        "generation": generation,
-        "emitter_states": [e.get_state() for e in emitters],
-        "best_solution": best_solution,
-        "best_throughput": best_throughput,
-        "rng_state": rng_state,
-        "total_sims": total_sims,
-        "cumulative_wallclock_s": cumulative_wallclock_s,
-        "surrogate_state": _save_surrogate_state(surrogate),
-    }
-    path = Path(path)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "wb") as f:
-        pickle.dump(state, f)
-    tmp.replace(path)
-
-
-def load_checkpoint(path):
-    with open(path, "rb") as f:
-        state = pickle.load(f)
-    emitters = [CMAEmitter.from_state(s) for s in state["emitter_states"]]
-    return (
-        state["generation"],
-        emitters,
-        state["best_solution"],
-        state["best_throughput"],
-        state["rng_state"],
-        state["total_sims"],
-        state.get("cumulative_wallclock_s", 0.0),
-        state.get("surrogate_state"),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Surrogate logger (per-generation metadata)
-# ---------------------------------------------------------------------------
-
-class SurrogateLogger:
-    """Writes per-generation surrogate metadata to surrogate_log.csv."""
-
-    HEADER = ["generation", "mode", "n_simulated", "surrogate_rho",
-              "mean_std", "selected_std", "train_time_s", "total_sims_saved"]
-
-    def __init__(self, log_dir, resume=False):
-        self.path = Path(log_dir) / "surrogate_log.csv"
-        if resume and self.path.exists():
-            self._f = open(self.path, "a", newline="")
-            self._w = csv.writer(self._f)
-        else:
-            self._f = open(self.path, "w", newline="")
-            self._w = csv.writer(self._f)
-            self._w.writerow(self.HEADER)
-
-    def log(self, generation, mode, n_simulated, surrogate_rho,
-            mean_std, selected_std, train_time_s, total_sims_saved):
-        rho_str  = f"{surrogate_rho:.4f}" if surrogate_rho  is not None else ""
-        mstd_str = f"{mean_std:.4f}"      if mean_std       is not None else ""
-        sstd_str = f"{selected_std:.4f}"  if selected_std   is not None else ""
-        self._w.writerow([generation, mode, n_simulated, rho_str,
-                          mstd_str, sstd_str,
-                          f"{train_time_s:.2f}", total_sims_saved])
-        self._f.flush()
-
-    def close(self):
-        self._f.close()
-
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-def run_surrogate_cmaes(
-    generations=300,
+def run_surrogate_cmaes_online(
+    generations=100,
     n_emitters=5,
     popsize_per_emitter=20,
-    n_evals=5,
+    n_evals=2,
     num_agents=400,
     simulation_steps=1000,
-    sigma0=5.0,
-    initial_mean=5.0,
+    update_interval=20,
+    sigma0=0.1,
+    initial_mean=0.0,
     seed=42,
-    output_dir="results/surrogate_v3",
+    output_dir="results/online_surrogate",
     resume=False,
-    n_workers=8,
-    warmup_gens=20,
+    n_workers=4,
+    chunk_size=20,
+    warmup_gens=10,
     screen_k=20,
     evolution_control_interval=10,
     n_ensemble=5,
     bootstrap_frac=0.8,
     ucb_lambda=1.0,
 ):
-    """Run surrogate-assisted multi-emitter CMA-ES with ensemble UCB screening.
+    """Run surrogate-assisted multi-emitter CMA-ES on the online GGO CNN policy.
 
     Args:
         warmup_gens: Generations of full evaluation before activating surrogate.
-        screen_k: Candidates to simulate per generation (after warmup).
-        evolution_control_interval: Every N gens after warmup, do a full eval
-            and retrain the surrogate from scratch to correct drift.
-        n_ensemble: Number of MLP models in the ensemble.
-        bootstrap_frac: Fraction of data each ensemble model trains on.
-        ucb_lambda: Exploration weight in UCB = mean + ucb_lambda * std.
-            Higher values favour uncertain (unexplored) candidates.
+        screen_k: Candidates to simulate per surrogate generation.
+        evolution_control_interval: Every N gens, do full eval and retrain surrogate.
+        n_ensemble: Ensemble MLP models.
+        bootstrap_frac: Bootstrap fraction per model.
+        ucb_lambda: UCB exploration weight (score = mean + lambda * std).
+        chunk_size: Candidates per Docker call (limits peak memory).
 
     Returns:
         best_solution, best_throughput
@@ -230,7 +78,7 @@ def run_surrogate_cmaes(
     except ImportError:
         raise ImportError("pycma is required: pip install cma")
 
-    sol_size = get_sol_size()
+    sol_size = get_n_params()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / CHECKPOINT_FILE
@@ -248,7 +96,6 @@ def run_surrogate_cmaes(
     acc_X_list = []
     acc_y_list = []
 
-    # --- Initialize or resume ---
     if resume and checkpoint_path.exists():
         print(f"Resuming from checkpoint: {checkpoint_path}")
         (start_gen, emitters, best_solution, best_throughput, rng_state,
@@ -290,14 +137,13 @@ def run_surrogate_cmaes(
         logger = RunLogger(output_dir, prefix="cmaes", n_evals=n_evals)
         surr_logger = SurrogateLogger(output_dir, resume=False)
 
-    print(f"Solution dimensionality: {sol_size}")
+    print(f"Online GGO surrogate CMA-ES | sol_size={sol_size}")
     print(f"Config: {generations} gens | warmup={warmup_gens} | "
           f"screen_k={screen_k}/{total_pop} | control_every={evolution_control_interval} | "
           f"ensemble={n_ensemble} | ucb_lambda={ucb_lambda}")
     print(f"Vanilla budget: {generations * total_pop * n_evals} sims | "
           f"Expected surrogate budget: ~{_estimate_sims(generations, warmup_gens, total_pop, n_evals, screen_k, evolution_control_interval)} sims")
 
-    # --- Main loop ---
     try:
         for gen in range(start_gen, generations):
             t0 = time.time()
@@ -318,7 +164,7 @@ def run_surrogate_cmaes(
             is_control = (not is_warmup) and (gen % evolution_control_interval == 0)
             use_surrogate = surrogate_ready and not is_warmup and not is_control
 
-            # 3. Get ensemble predictions (mean + uncertainty) for all candidates
+            # 3. Surrogate predictions
             surr_mean = None
             surr_std  = None
             mean_std_val = None
@@ -332,27 +178,25 @@ def run_surrogate_cmaes(
             selected_std_val = None
 
             if is_warmup or is_control:
-                # --- Full evaluation ---
                 mode = "warmup" if is_warmup else "control"
-                mean_tp, all_tp = evaluate_batch(
+                mean_tp, all_tp = evaluate_online_batch(
                     all_solutions,
                     num_agents=num_agents,
                     simulation_steps=simulation_steps,
+                    update_interval=update_interval,
                     n_evals=n_evals,
                     base_seed=eval_seed,
-                    normalize=True,
                     n_workers=n_workers,
+                    chunk_size=chunk_size,
                 )
                 total_sims += total_pop * n_evals
                 n_simulated = total_pop
                 full_mean_tp = mean_tp
 
-                # Rho BEFORE retraining = honest accuracy estimate
                 rho = None
                 if surr_mean is not None:
                     rho = spearman_rho(mean_tp, surr_mean)
 
-                # Accumulate and retrain ensemble on all real data
                 acc_X_list.append(all_solutions)
                 acc_y_list.append(mean_tp)
                 t_train = time.time()
@@ -365,7 +209,6 @@ def run_surrogate_cmaes(
                 logger.log_generation(gen, all_solutions, mean_tp, all_tp, emitter_ids)
 
             else:
-                # --- Surrogate-assisted with UCB screening ---
                 mode = "surrogate"
                 ucb_scores = surr_mean + ucb_lambda * surr_std
                 top_idx = np.argsort(-ucb_scores)[:screen_k]
@@ -374,20 +217,20 @@ def run_surrogate_cmaes(
                 eval_solutions   = all_solutions[top_idx]
                 eval_emitter_ids = emitter_ids[top_idx]
 
-                mean_tp, all_tp = evaluate_batch(
+                mean_tp, all_tp = evaluate_online_batch(
                     eval_solutions,
                     num_agents=num_agents,
                     simulation_steps=simulation_steps,
+                    update_interval=update_interval,
                     n_evals=n_evals,
                     base_seed=eval_seed,
-                    normalize=True,
                     n_workers=n_workers,
+                    chunk_size=chunk_size,
                 )
                 total_sims += screen_k * n_evals
                 sims_saved += (total_pop - screen_k) * n_evals
                 n_simulated = screen_k
 
-                # Placeholder fitnesses: real for top-k, surrogate mean for rest
                 full_mean_tp = surr_mean.copy()
                 full_mean_tp[top_idx] = mean_tp
 
@@ -401,22 +244,19 @@ def run_surrogate_cmaes(
 
                 rho = None
 
-            # 4. Tell each emitter (always full batch)
+            # 4. Tell emitters (full batch)
             pos = 0
             for emitter in emitters:
                 end = pos + emitter.popsize
-                emitter.tell(
-                    all_solutions[pos:end],
-                    -full_mean_tp[pos:end],
-                )
+                emitter.tell(all_solutions[pos:end], -full_mean_tp[pos:end])
                 pos = end
 
-            # 5. Track best (only from real evaluations)
+            # 5. Track best (real evaluations only)
             if use_surrogate:
-                real_mean_tp  = mean_tp
+                real_mean_tp   = mean_tp
                 real_solutions = eval_solutions
             else:
-                real_mean_tp  = full_mean_tp
+                real_mean_tp   = full_mean_tp
                 real_solutions = all_solutions
 
             gen_best_idx = np.argmax(real_mean_tp)
@@ -451,18 +291,19 @@ def run_surrogate_cmaes(
             if (gen + 1) % 5 == 0:
                 logger.flush_solutions()
 
-            # 8. Checkpoint
+            # 8. Checkpoint (gc first to free training arrays before pickling emitters)
+            gc.collect()
             save_checkpoint(
                 checkpoint_path, gen, emitters, best_solution, best_throughput,
                 rng.bit_generator.state, total_sims, cumulative_wallclock, surrogate,
             )
 
-            # 9. Print progress
-            cum_h, cum_m = divmod(int(cumulative_wallclock), 3600)
-            cum_m = cum_m // 60
+            # 9. Print
+            cum_h, cum_rem = divmod(int(cumulative_wallclock), 3600)
+            cum_m = cum_rem // 60
             restart_str = f" | restarts={restart_info}" if restart_info else ""
-            rho_str  = f" | rho={rho:.3f}"               if rho          is not None else ""
-            std_str  = f" | std={mean_std_val:.3f}"       if mean_std_val is not None else ""
+            rho_str     = f" | rho={rho:.3f}"           if rho is not None else ""
+            std_str     = f" | std={mean_std_val:.3f}"   if mean_std_val is not None else ""
             print(
                 f"Gen {gen+1:3d}/{generations} [{mode:9s}] | "
                 f"best={best_throughput:.4f} | "
@@ -477,8 +318,8 @@ def run_surrogate_cmaes(
         logger.close()
         surr_logger.close()
 
-    h, m = divmod(int(cumulative_wallclock), 3600)
-    m = m // 60
+    h, rem = divmod(int(cumulative_wallclock), 3600)
+    m = rem // 60
     print(f"\nOptimization complete.")
     print(f"Best throughput: {best_throughput:.4f}")
     print(f"Total simulations: {total_sims} (saved {sims_saved} vs vanilla)")
@@ -490,34 +331,25 @@ def run_surrogate_cmaes(
     return best_solution, best_throughput
 
 
-def _estimate_sims(generations, warmup_gens, total_pop, n_evals, screen_k, ctrl_interval):
-    warmup = warmup_gens * total_pop * n_evals
-    remaining = generations - warmup_gens
-    control_gens = remaining // ctrl_interval
-    surrogate_gens = remaining - control_gens
-    return warmup + control_gens * total_pop * n_evals + surrogate_gens * screen_k * n_evals
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Surrogate-assisted CMA-ES (ensemble MLP + UCB screening)")
-    parser.add_argument("--generations",                type=int,   default=300)
+        description="Surrogate-assisted CMA-ES for online GGO (CNN policy)"
+    )
+    parser.add_argument("--generations",                type=int,   default=100)
     parser.add_argument("--n-emitters",                 type=int,   default=5)
     parser.add_argument("--popsize",                    type=int,   default=20)
-    parser.add_argument("--n-evals",                    type=int,   default=5)
+    parser.add_argument("--n-evals",                    type=int,   default=2)
     parser.add_argument("--num-agents",                 type=int,   default=400)
     parser.add_argument("--simulation-steps",           type=int,   default=1000)
-    parser.add_argument("--sigma0",                     type=float, default=5.0)
-    parser.add_argument("--initial-mean",               type=float, default=5.0)
+    parser.add_argument("--update-interval",            type=int,   default=20)
+    parser.add_argument("--sigma0",                     type=float, default=0.1)
+    parser.add_argument("--initial-mean",               type=float, default=0.0)
     parser.add_argument("--seed",                       type=int,   default=42)
-    parser.add_argument("--output",                     type=str,   default="results/surrogate_v3")
+    parser.add_argument("--output",                     type=str,   default="results/online_surrogate")
     parser.add_argument("--resume",                     action="store_true")
-    parser.add_argument("--n-workers",                  type=int,   default=8)
-    parser.add_argument("--warmup-gens",                type=int,   default=20)
+    parser.add_argument("--n-workers",                  type=int,   default=4)
+    parser.add_argument("--chunk-size",                 type=int,   default=20)
+    parser.add_argument("--warmup-gens",                type=int,   default=10)
     parser.add_argument("--screen-k",                   type=int,   default=20)
     parser.add_argument("--evolution-control-interval", type=int,   default=10)
     parser.add_argument("--n-ensemble",                 type=int,   default=5)
@@ -525,19 +357,21 @@ def main():
     parser.add_argument("--ucb-lambda",                 type=float, default=1.0)
     args = parser.parse_args()
 
-    run_surrogate_cmaes(
+    run_surrogate_cmaes_online(
         generations=args.generations,
         n_emitters=args.n_emitters,
         popsize_per_emitter=args.popsize,
         n_evals=args.n_evals,
         num_agents=args.num_agents,
         simulation_steps=args.simulation_steps,
+        update_interval=args.update_interval,
         sigma0=args.sigma0,
         initial_mean=args.initial_mean,
         seed=args.seed,
         output_dir=args.output,
         resume=args.resume,
         n_workers=args.n_workers,
+        chunk_size=args.chunk_size,
         warmup_gens=args.warmup_gens,
         screen_k=args.screen_k,
         evolution_control_interval=args.evolution_control_interval,

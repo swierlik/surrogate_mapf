@@ -20,8 +20,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 GGO_ROOT = PROJECT_ROOT / "ggo_public"
 
-# Map metadata
-MAP_REL_PATH = "maps/competition/human/pibt_warehouse_33x36_w_mode.json"
+# Map metadata — override with MAPF_MAP_REL_PATH env var to use a different map
+MAP_REL_PATH = os.environ.get(
+    "MAPF_MAP_REL_PATH",
+    "maps/competition/human/pibt_warehouse_33x36_w_mode.json",
+)
 CONFIG_REL_PATH = "WPPL/configs/pibt_default_no_rot.json"
 COMP_OBJ_TYPES = ".@ews"
 OBSTACLE_IDX = COMP_OBJ_TYPES.index("@")
@@ -31,11 +34,11 @@ DOCKER_IMAGE = "ggo_sim"
 
 
 def _layout_to_np(layout):
-    """Convert list-of-strings map layout to integer numpy array."""
-    return np.array(
-        [[COMP_OBJ_TYPES.index(ch) for ch in line] for line in layout],
-        dtype=int,
-    )
+    """Convert list-of-strings map layout to integer numpy array.
+    Unknown characters (e.g. 'T' for trees in random maps) are treated as obstacles."""
+    def _idx(ch):
+        return COMP_OBJ_TYPES.index(ch) if ch in COMP_OBJ_TYPES else OBSTACLE_IDX
+    return np.array([[_idx(ch) for ch in line] for line in layout], dtype=int)
 
 
 def _count_valid_vertices(map_np):
@@ -199,7 +202,7 @@ def _build_batch_eval_script(batch_data, num_agents, simulation_steps,
     return f'''import json, sys
 from multiprocessing import Pool
 
-MAP_PATH = "maps/competition/human/pibt_warehouse_33x36_w_mode.json"
+MAP_PATH = "{MAP_REL_PATH}"
 CONFIG_PATH = "WPPL/configs/pibt_default_no_rot.json"
 
 batch_data = {json.dumps(batch_data)}
