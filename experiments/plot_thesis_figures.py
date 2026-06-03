@@ -410,20 +410,10 @@ def fig7_online_ggo():
     v_cross_sims = int(v_cum[np.argmax(np.maximum.accumulate(vb["best_throughput"].values) >= tau)])
     s_cross_sims = int(s_cum[np.argmax(np.maximum.accumulate(sb["best_throughput"].values) >= tau)])
 
-    rho_mask = sl["mode"].isin(["warmup", "control"])
-    rho_gens = sl.loc[rho_mask, "generation"].values
-    rho_vals = sl.loc[rho_mask, "surrogate_rho"].values
+    fig, ax1 = plt.subplots(1, 1, figsize=(8, 3.8))
+    _style(ax1)
+    ax1.tick_params(labelsize=12)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 6),
-                                   gridspec_kw={"hspace": 0.42})
-    for ax in (ax1, ax2):
-        _style(ax)
-        ax.tick_params(labelsize=12)
-
-    fig.suptitle("Online GGO: Surrogate vs. Vanilla CMA-ES on CNN Policy Optimisation",
-                 fontsize=12, y=1.01)
-
-    # ── Top: sample efficiency ───────────────────────────────────────────────
     ax1.plot(v_cum, v_tp, color=C_VAN,  linewidth=1.8, label="Vanilla CMA-ES")
     ax1.plot(s_cum, s_tp, color=C_SURR, linewidth=1.8, label="Surrogate (UCB, k=20)")
 
@@ -431,7 +421,7 @@ def fig7_online_ggo():
     ax1.plot([s_cum[-1], v_cum[-1]], [s_tp[-1], s_tp[-1]],
              color=C_SURR, linewidth=1.2, linestyle="--")
 
-    # Crossover vertical lines — labels sit at the top of each line
+    # Crossover vertical lines
     TOP_Y = 7.78
     for x_cross, lbl, color in [
             (s_cross_sims, f"Surrogate\n{s_cross_sims:,} sims", C_SURR),
@@ -454,31 +444,9 @@ def fig7_online_ggo():
     ax1.set_yticks([5.0, 5.5, 6.0, 6.5, 7.0, 7.5])
     ax1.set_xlabel("Cumulative simulations", fontsize=12)
     ax1.set_ylabel("Best throughput (tasks/step)", fontsize=12)
-    ax1.set_title("Sample Efficiency", fontsize=11, pad=5)
+    ax1.set_title("Online GGO: Surrogate vs. Vanilla CMA-ES on CNN Policy Optimisation",
+                  fontsize=11, pad=6)
     ax1.legend(loc="lower right", **{**LEGEND_KW, "fontsize": 10.5})
-
-    # ── Bottom: online surrogate rho ─────────────────────────────────────────
-    ax2.axvspan(0, 9, color=C_WARM, alpha=0.8, zorder=0, label="Warmup phase")
-
-    ax2.axhline(0, color=C_GRAY, linewidth=0.6, zorder=1)
-
-    valid = ~np.isnan(rho_vals)
-    ax2.plot(rho_gens[valid], rho_vals[valid], color=C_SURR, linewidth=1.4,
-             marker="o", markersize=3, label="Spearman ρ (control gens)")
-
-    warm_patch = mpatches.Patch(color=C_WARM, label="Warmup phase")
-    ax2.legend(handles=[
-        ax2.lines[-1],
-        warm_patch,
-    ], loc="lower right", **{**LEGEND_KW, "fontsize": 10.5})
-
-    ax2.set_xlim(0, 102)
-    ax2.set_ylim(-0.35, 0.85)
-    ax2.set_xticks([0, 20, 40, 60, 80, 100])
-    ax2.set_yticks([-0.2, 0, 0.2, 0.4, 0.6, 0.8])
-    ax2.set_xlabel("Generation", fontsize=12)
-    ax2.set_ylabel("Spearman ρ", fontsize=12)
-    ax2.set_title("Surrogate Rank Correlation During Optimisation", fontsize=11, pad=5)
 
     fig.tight_layout()
     _save(fig, "fig7_online_ggo.png")

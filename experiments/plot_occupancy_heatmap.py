@@ -36,7 +36,7 @@ def get_gen0_best():
 # resolved at runtime so gen-0 array is extracted from the big solutions file
 PANEL_DEFS = [
     ("Generation 0 (random init)", "gen0"),
-    ("Surrogate V3 best",          "results/surrogate_v3/best_solution.npy"),
+    ("Optimized solution",          "results/surrogate_v3/best_solution.npy"),
 ]
 
 

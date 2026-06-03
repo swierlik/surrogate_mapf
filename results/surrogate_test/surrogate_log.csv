@@ -1,0 +1,6 @@
+generation,mode,n_simulated,surrogate_rho,train_time_s,total_sims_saved
+0,warmup,100,,10.30,0
+1,warmup,100,0.2880,0.31,0
+2,warmup,100,0.2400,0.43,0
+3,warmup,100,0.3614,0.47,0
+4,warmup,100,0.1432,0.54,0

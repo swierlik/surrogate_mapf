@@ -1,5 +1,6 @@
 # Simulation results (too large for git - 1.9GB+)
-results/
+*.pkl
+*.npy
 
 # Python
 __pycache__/
@@ -26,3 +27,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+Thesis_Final/
+Thesis_Plans__Findings/
